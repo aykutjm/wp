@@ -21,6 +21,11 @@
         .status-tamamlandı { background-color: #16a34a; color: #ffffff; }
         .status-durduruldu { background-color: #ef4444; color: #ffffff; }
         
+        .device-status { padding: 2px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 600; }
+        .device-connected { background-color: #dcfce7; color: #166534; border: 1px solid #86efac;}
+        .device-disconnected { background-color: #fee2e2; color: #991b1b; border: 1px solid #fca5a5;}
+        .device-connecting { background-color: #fef9c3; color: #854d0e; border: 1px solid #fde047;}
+
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: #e5e7eb; }
         ::-webkit-scrollbar-thumb { background: #9ca3af; border-radius: 10px; }
@@ -96,6 +101,11 @@
     </div>
 
 <script type="module">
+    // --- SUNUCU YAPILANDIRMASI (BURAYI KENDİ BİLGİLERİNİZLE DÜZENLEYİN) ---
+    const EVOLUTION_API_URL = "https://evo-2.edu-ai.online";
+    const EVOLUTION_API_KEY = "iHAF8gWNA1axdRDY9e98UKpork00dBO2";
+    // --- ///////////////////////////////////////////////////////////////// ---
+
     // Firebase SDK'ları (Sürüm 12.3.0)
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-app.js";
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-auth.js";
@@ -106,8 +116,9 @@
     const state = {
         db: null, auth: null, storage: null, userId: null,
         appId: 'default-app-id', currentPage: 'dashboard',
-        collections: { campaigns: [], templates: [], groups: [], settings: { accounts: [] } },
+        collections: { campaigns: [], templates: [], groups: [], settings: { devices: [] } },
         listeners: {}, isSending: false, sendingCampaignId: null,
+        qrPollInterval: null,
     };
 
     // --- Toast Notification ---
@@ -124,15 +135,13 @@
             const container = document.getElementById('modal-container');
             container.innerHTML = `
                 <div id="modal-backdrop" class="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-40 p-4">
-                    <div id="modal-content" class="bg-white rounded-lg shadow-2xl w-full max-w-3xl transform transition-all scale-95 opacity-0">
+                    <div id="modal-content" class="bg-white rounded-lg shadow-2xl w-full ${config.width || 'max-w-3xl'} transform transition-all scale-95 opacity-0">
                         <div class="flex justify-between items-center p-5 border-b border-gray-200">
                             <h3 class="text-xl font-semibold text-gray-800">${config.title}</h3>
                             <button id="modal-close-btn" class="text-gray-400 hover:text-gray-600 text-3xl">&times;</button>
                         </div>
                         <div class="p-6 max-h-[70vh] overflow-y-auto">${config.body}</div>
-                        <div class="flex justify-end items-center p-4 bg-gray-50 rounded-b-lg space-x-3">
-                            ${config.footer}
-                        </div>
+                        ${config.footer ? `<div class="flex justify-end items-center p-4 bg-gray-50 rounded-b-lg space-x-3">${config.footer}</div>` : ''}
                     </div>
                 </div>`;
             document.getElementById('modal-close-btn').onclick = this.hide;
@@ -144,6 +153,7 @@
             if (config.onReady) config.onReady();
         },
         hide() {
+            if (state.qrPollInterval) { clearInterval(state.qrPollInterval); state.qrPollInterval = null; }
             const backdrop = document.getElementById('modal-backdrop');
             if (backdrop) {
                 const content = document.getElementById('modal-content');
@@ -164,6 +174,95 @@
         }
     };
 
+    // --- Campaign Sending Logic (REAL) ---
+    async function checkAndSendCampaigns() {
+        if (state.isSending) return;
+        const now = new Date();
+        const campaignsToStart = state.collections.campaigns.filter(c => c.status === 'planlandı' && c.schedule?.[0]?.sendTime.toDate() <= now);
+
+        if (campaignsToStart.length > 0) {
+            campaignsToStart.sort((a,b) => a.schedule[0].sendTime.toDate() - b.schedule[0].sendTime.toDate());
+            await sendCampaign(campaignsToStart[0]);
+        }
+    }
+    
+    async function sendCampaign(campaign) {
+        if (!campaign || state.isSending) return;
+        
+        if (!isApiConfigured()) {
+            showToast("Lütfen önce API ayarlarınızı yapın.", true);
+            await Firestore.update('campaigns', campaign.id, { status: 'durduruldu' });
+            return;
+        }
+
+        state.isSending = true; state.sendingCampaignId = campaign.id;
+        showToast(`'${campaign.name}' kampanyası gönderimi başlıyor.`);
+        
+        try {
+            await Firestore.update('campaigns', campaign.id, { status: 'gönderiliyor' });
+
+            const group = state.collections.groups.find(g => g.id === campaign.groupId);
+            const device = (state.collections.settings.devices || []).find(d => d.id === campaign.deviceId);
+            const delays = state.collections.settings.delays || { min: 10, max: 30, longMin: 60, longMax: 120, trigger: 25 };
+
+            if (!group || !device) throw new Error("Grup veya cihaz bilgisi bulunamadı.");
+            
+            let sentInCampaign = campaign.sentCount || 0;
+            let errorInCampaign = campaign.errorCount || 0;
+            const allNumbers = [...group.numbers];
+            let numbersSentSoFar = 0;
+
+            for (const scheduleItem of campaign.schedule) {
+                 const numbersForThisBatch = allNumbers.slice(numbersSentSoFar, numbersSentSoFar + scheduleItem.count);
+                 numbersSentSoFar += numbersForThisBatch.length;
+
+                 const waitTime = scheduleItem.sendTime.toDate() - new Date();
+                 if (waitTime > 0) {
+                    showToast(`${campaign.name}: Bir sonraki parça için ${Math.round(waitTime/1000)} saniye bekleniyor.`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                 }
+
+                 for(const number of numbersForThisBatch) {
+                    const isLongDelay = (sentInCampaign + 1) % delays.trigger === 0;
+                    const delay = isLongDelay ? (Math.random() * (delays.longMax - delays.longMin) + delays.longMin) * 1000 : (Math.random() * (delays.max - delays.min) + delays.min) * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    
+                    try {
+                        const endpoint = campaign.imageUrl ? '/message/sendMedia' : '/message/sendText';
+                        const url = `${EVOLUTION_API_URL}${endpoint}/${device.instanceName}`;
+                        const payload = campaign.imageUrl 
+                            ? { number: number, mediaMessage: { media: campaign.imageUrl, caption: campaign.message } }
+                            : { number: number, textMessage: { text: campaign.message } };
+
+                        const response = await fetch(url, { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json', 'apikey': device.apiKey }, 
+                            body: JSON.stringify(payload) 
+                        });
+                        if(!response.ok) {
+                            const errorData = await response.json();
+                            throw new Error(`Evolution API Hatası: ${errorData.message || response.status}`);
+                        }
+                        sentInCampaign++;
+                    } catch (e) {
+                        console.error(`Gönderim hatası ${number}:`, e);
+                        errorInCampaign++;
+                    }
+                    await Firestore.update('campaigns', campaign.id, { sentCount: sentInCampaign, errorCount: errorInCampaign });
+                 }
+            }
+            
+            await Firestore.update('campaigns', campaign.id, { status: 'tamamlandı' });
+            showToast(`'${campaign.name}' kampanyası tamamlandı.`);
+        } catch (error) {
+            console.error("Kampanya Gönderim Hatası:", error);
+            showToast(`Kampanya hatası: ${error.message}`, true);
+            await Firestore.update('campaigns', campaign.id, { status: 'durduruldu' });
+        } finally {
+            state.isSending = false; state.sendingCampaignId = null;
+        }
+    }
+
     // --- Firebase & Data ---
     async function initializeFirebase() {
         try {
@@ -178,11 +277,17 @@
 
             onAuthStateChanged(state.auth, user => {
                 if (user) {
-                    state.userId = user.uid;
-                    document.getElementById('user-id-display').textContent = `ID: ${user.uid}`;
-                    document.getElementById('user-id-display').title = `Kullanıcı ID: ${user.uid}`;
-                    setupRealtimeListeners();
-                    setInterval(checkAndSendCampaigns, 30 * 1000); 
+                    if (!state.userId) {
+                        state.userId = user.uid;
+                        document.getElementById('user-id-display').textContent = `ID: ${user.uid}`;
+                        document.getElementById('user-id-display').title = `Kullanıcı ID: ${user.uid}`;
+                        
+                        setupRealtimeListeners();
+                        setInterval(checkAndSendCampaigns, 30 * 1000); 
+
+                        window.addEventListener('hashchange', handleNavigation);
+                        handleNavigation(); 
+                    }
                 }
             });
             
@@ -191,7 +296,10 @@
             } else {
                 await signInAnonymously(state.auth);
             }
-        } catch (error) { console.error("Firebase Hatası:", error); showToast(`Firebase başlatılamadı: ${error.message}`, true); }
+        } catch (error) { 
+            console.error("Firebase Hatası:", error); 
+            showToast(`Firebase başlatılamadı: ${error.message}`, true); 
+        }
     }
 
     function setupRealtimeListeners() {
@@ -215,7 +323,7 @@
                     state.collections.settings = docSnap.data();
                 } else {
                     const defaultSettings = {
-                        accounts: [{id: Date.now(), name: "Varsayılan Hesap", phone: "905000000000", webhook: "https://example.com"}],
+                        devices: [],
                         delays: { min: 10, max: 30, longMin: 60, longMax: 120, trigger: 25 }
                     };
                     setDoc(settingsDocRef, defaultSettings);
@@ -250,7 +358,7 @@
         async updateSettings(data) {
              try {
                 await setDoc(doc(state.db, "artifacts", state.appId, "users", state.userId, "app_settings/main"), data, { merge: true });
-                showToast(`Ayarlar başarıyla güncellendi.`); return true;
+                return true;
             } catch (error) { console.error("Firestore Settings Update Error:", error); showToast(`Ayarları güncelleme hatası: ${error.message}`, true); return false; }
         }
     };
@@ -259,13 +367,8 @@
     const appContent = document.getElementById('app-content');
     const pageRenderers = { dashboard: renderDashboard, kampanyalar: renderCampaigns, planlanmis: renderPlanlanmis, raporlar: renderRaporlar, sablonlar: renderTemplates, gruplar: renderGroups, ayarlar: renderSettings };
 
-    function renderPage(title, buttonHtml, contentHtml) {
-        appContent.innerHTML = `
-            <div class="flex justify-between items-center mb-6"><h2 class="text-3xl font-bold text-gray-800">${title}</h2><div>${buttonHtml}</div></div>
-            <div class="bg-white rounded-lg shadow-md"><div class="overflow-x-auto">${contentHtml}</div></div>`;
-    }
+    function renderPage(title, buttonHtml, contentHtml) { appContent.innerHTML = `<div class="flex justify-between items-center mb-6"><h2 class="text-3xl font-bold text-gray-800">${title}</h2><div>${buttonHtml}</div></div><div class="bg-white rounded-lg shadow-md"><div class="overflow-x-auto">${contentHtml}</div></div>`; }
     function createStatCard(title, value, color) { return `<div class="bg-white p-6 rounded-lg shadow-md"><p class="text-sm text-gray-500">${title}</p><p class="text-3xl font-bold ${color}">${value}</p></div>`; }
-
     function renderDashboard() {
         const { campaigns } = state.collections;
         const stats = campaigns.reduce((acc, c) => ({ ...acc, [c.status]: (acc[c.status] || 0) + 1 }), { total: campaigns.length });
@@ -351,16 +454,18 @@
         appContent.querySelectorAll('.delete-btn').forEach(btn => btn.onclick = () => ModalManager.confirm('Grubu Sil', 'Emin misiniz?', () => Firestore.delete('groups', btn.dataset.id)));
     }
     function renderSettings() {
-        const { accounts = [], delays = { min: 10, max: 30, longMin: 60, longMax: 120, trigger: 25 } } = state.collections.settings;
+        const { devices = [], delays = { min: 10, max: 30, longMin: 60, longMax: 120, trigger: 25 } } = state.collections.settings;
         const content = `
             <div class="p-6 space-y-8">
                 <div>
-                    <h3 class="text-lg font-semibold text-gray-800 mb-3">WhatsApp Hesapları</h3>
-                    <div id="accounts-container" class="space-y-2">${accounts.map(acc => createAccountInput(acc)).join('')}</div>
-                    <button id="add-account-btn" class="mt-2 text-sm bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-md"><i class="fas fa-plus mr-1"></i> Yeni Hesap Ekle</button>
+                    <h3 class="text-lg font-semibold text-gray-800 mb-3">Cihaz Yönetimi</h3>
+                    <div class="bg-gray-50 p-4 rounded-md border border-gray-200 space-y-3" id="devices-container">
+                        ${devices.length > 0 ? devices.map(renderDeviceCard).join('') : '<p class="text-sm text-gray-500 text-center">Henüz cihaz bağlanmamış.</p>'}
+                    </div>
+                    <button id="add-device-btn" class="mt-4 text-sm bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"><i class="fas fa-plus mr-2"></i> Yeni Cihaz Bağla</button>
                 </div>
                 <div class="border-t pt-6">
-                     <h3 class="text-lg font-semibold text-gray-800 mb-3">Gönderim Ayarları</h3>
+                     <h3 class="text-lg font-semibold text-gray-800 mb-3">Genel Gönderim Ayarları</h3>
                      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                         <div><label class="block text-sm font-medium">Min Bekleme (sn)</label><input type="number" id="delay-min" class="mt-1 block w-full border border-gray-300 rounded-md p-2" value="${delays.min}"></div>
                         <div><label class="block text-sm font-medium">Max Bekleme (sn)</label><input type="number" id="delay-max" class="mt-1 block w-full border border-gray-300 rounded-md p-2" value="${delays.max}"></div>
@@ -370,40 +475,50 @@
                      </div>
                 </div>
             </div>`;
-        renderPage('Ayarlar', `<button id="save-settings-btn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg">Ayarları Kaydet</button>`, content);
+        renderPage('Ayarlar', `<button id="save-settings-btn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg">Gönderim Ayarlarını Kaydet</button>`, content);
         
-        document.getElementById('add-account-btn').onclick = () => {
-            document.getElementById('accounts-container').insertAdjacentHTML('beforeend', createAccountInput({id: Date.now()}));
-        };
-        document.getElementById('accounts-container').addEventListener('click', (e) => {
-            if(e.target.closest('.remove-account-btn')) e.target.closest('.account-item').remove();
-        });
+        document.getElementById('add-device-btn').onclick = () => showAddDeviceModal();
+        appContent.querySelectorAll('.delete-device-btn').forEach(btn => btn.onclick = () => ModalManager.confirm('Cihazı Sil', 'Bu cihazı silmek istediğinizden emin misiniz?', () => saveDevices(devices.filter(d => d.id != btn.dataset.id))));
+        appContent.querySelectorAll('.connect-device-btn').forEach(btn => btn.onclick = () => connectDevice(devices.find(d => d.id == btn.dataset.id)));
+        appContent.querySelectorAll('.disconnect-device-btn').forEach(btn => btn.onclick = () => disconnectDevice(devices.find(d => d.id == btn.dataset.id)));
+
         document.getElementById('save-settings-btn').onclick = async (e) => {
-            const btn = e.currentTarget; btn.disabled = true;
-            const newAccounts = Array.from(document.querySelectorAll('.account-item')).map(item => ({
-                id: item.dataset.id,
-                name: item.querySelector('.account-name').value,
-                phone: item.querySelector('.account-phone').value,
-                webhook: item.querySelector('.account-webhook').value,
-            }));
+            const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Kaydediliyor...';
             const newDelays = {
                 min: parseInt(document.getElementById('delay-min').value), max: parseInt(document.getElementById('delay-max').value),
                 trigger: parseInt(document.getElementById('delay-trigger').value), longMin: parseInt(document.getElementById('delay-long-min').value),
                 longMax: parseInt(document.getElementById('delay-long-max').value),
             };
-            if (await Firestore.updateSettings({ accounts: newAccounts, delays: newDelays })) {
-                showToast("Ayarlar kaydedildi.");
+            if (await Firestore.updateSettings({ delays: newDelays })) {
+                showToast("Gönderim ayarları kaydedildi.");
             }
-            btn.disabled = false;
+            btn.disabled = false; btn.textContent = 'Gönderim Ayarlarını Kaydet';
         };
     }
-    function createAccountInput(account = {}) {
+
+    function renderDeviceCard(device) {
+        const statusMap = { connected: 'device-connected', disconnected: 'device-disconnected', connecting: 'device-connecting' };
+        const statusTextMap = { connected: 'Bağlandı', disconnected: 'Bağlı Değil', connecting: 'Bağlanıyor' };
+        const statusClass = statusMap[device.status] || 'device-disconnected';
+        const statusText = statusTextMap[device.status] || 'Bilinmiyor';
+
         return `
-            <div class="account-item flex items-center gap-2 bg-gray-50 p-2 rounded" data-id="${account.id || ''}">
-                <input type="text" placeholder="Hesap Adı" class="account-name border border-gray-300 rounded-md p-1.5 w-1/4" value="${account.name || ''}">
-                <input type="text" placeholder="Telefon No (90...)" class="account-phone border border-gray-300 rounded-md p-1.5 w-1/4" value="${account.phone || ''}">
-                <input type="text" placeholder="Webhook URL" class="account-webhook border border-gray-300 rounded-md p-1.5 w-2/4 flex-grow" value="${account.webhook || ''}">
-                <button class="remove-account-btn text-red-500 p-1"><i class="fas fa-trash"></i></button>
+            <div class="bg-white p-4 rounded-lg border border-gray-200 flex flex-wrap items-center justify-between gap-4">
+                <div class="flex items-center gap-4">
+                    <i class="fas fa-mobile-alt text-2xl text-gray-500"></i>
+                    <div>
+                        <p class="font-semibold text-gray-800">${device.cihazAdi}</p>
+                        <p class="text-sm text-gray-600">${device.phone || 'Numara Yok'}</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <span class="device-status ${statusClass}">${statusText}</span>
+                    <div class="flex gap-2">
+                        ${device.status !== 'connected' ? `<button data-id="${device.id}" class="connect-device-btn bg-green-500 hover:bg-green-600 text-white text-xs font-bold py-1 px-3 rounded-md">Bağlan</button>` : ''}
+                        ${device.status === 'connected' ? `<button data-id="${device.id}" class="disconnect-device-btn bg-red-500 hover:bg-red-600 text-white text-xs font-bold py-1 px-3 rounded-md">Bağlantıyı Kes</button>` : ''}
+                        <button data-id="${device.id}" class="delete-device-btn text-gray-500 hover:text-red-600"><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
             </div>`;
     }
 
@@ -411,7 +526,7 @@
      function showCampaignModal(campaign = null) {
         const isEdit = !!campaign;
         const groupsOptions = state.collections.groups.map(g => `<option value="${g.id}" ${isEdit && g.id === campaign.groupId ? 'selected' : ''}>${g.name}</option>`).join('');
-        const accountsOptions = (state.collections.settings.accounts || []).map(a => `<option value="${a.id}" ${isEdit && a.id === campaign.accountId ? 'selected' : ''}>${a.name} (${a.phone})</option>`).join('');
+        const accountsOptions = (state.collections.settings.devices || []).map(d => `<option value="${d.id}" ${isEdit && d.id === campaign.deviceId ? 'selected' : ''}>${d.cihazAdi} (${d.phone})</option>`).join('');
         const templatesOptions = state.collections.templates.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
         
         ModalManager.show({
@@ -419,7 +534,7 @@
             body: `<div class="space-y-4">
                 <div><label class="block text-sm font-medium text-gray-700">Kampanya Adı</label><input type="text" id="campaign-name" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" value="${campaign?.name || ''}"></div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div><label class="block text-sm font-medium text-gray-700">WhatsApp Hesabı</label><select id="campaign-account" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2">${accountsOptions}</select></div>
+                    <div><label class="block text-sm font-medium text-gray-700">Gönderici Cihaz</label><select id="campaign-device" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2">${accountsOptions}</select></div>
                     <div><label class="block text-sm font-medium text-gray-700">Hedef Kişi Grubu</label><select id="campaign-group" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"><option value="">-- Grup Seç --</option>${groupsOptions}</select><span id="group-count" class="text-xs text-gray-500 mt-1"></span></div>
                 </div>
                  <div><label class="block text-sm font-medium text-gray-700">Mesaj Şablonu</label><select id="campaign-template-select" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"><option value="">-- Şablon Seç --</option>${templatesOptions}</select></div>
@@ -573,7 +688,7 @@
 
                         const data = {
                             name: document.getElementById('campaign-name').value.trim(),
-                            accountId: document.getElementById('campaign-account').value,
+                            deviceId: document.getElementById('campaign-device').value,
                             groupId: document.getElementById('campaign-group').value,
                             message: document.getElementById('campaign-message').value.trim(),
                             sendType: sendType,
@@ -584,7 +699,7 @@
                             imageUrl: imageUrl
                         };
 
-                        if(!data.name || !data.accountId || !data.groupId || !data.message) validationError = "Lütfen tüm zorunlu alanları doldurun.";
+                        if(!data.name || !data.deviceId || !data.groupId || !data.message) validationError = "Lütfen tüm zorunlu alanları doldurun.";
                         if(validationError) throw new Error(validationError);
 
                         const success = isEdit ? await Firestore.update('campaigns', campaign.id, data) : await Firestore.add('campaigns', data);
@@ -605,13 +720,13 @@
 
     function showCampaignDetailsModal(campaign) { 
         const group = state.collections.groups.find(g => g.id === campaign.groupId);
-        const account = (state.collections.settings.accounts || []).find(a => a.id === campaign.accountId);
+        const device = (state.collections.settings.devices || []).find(d => d.id === campaign.deviceId);
         
         let scheduleHtml = campaign.schedule.map(s => `<li>${new Date(s.sendTime.toDate()).toLocaleString('tr-TR')} - <strong>${s.count}</strong> kişi</li>`).join('');
 
         const body = `
             <dl class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4 text-sm">
-                <div class="col-span-1"><dt class="font-medium text-gray-500">Hesap</dt><dd class="mt-1 text-gray-900">${account?.name || 'N/A'}</dd></div>
+                <div class="col-span-1"><dt class="font-medium text-gray-500">Cihaz</dt><dd class="mt-1 text-gray-900">${device?.cihazAdi || 'N/A'}</dd></div>
                 <div class="col-span-1"><dt class="font-medium text-gray-500">Grup</dt><dd class="mt-1 text-gray-900">${group?.name || 'N/A'} (${group?.numbers.length || 0} kişi)</dd></div>
                 <div class="col-span-2"><dt class="font-medium text-gray-500">Mesaj İçeriği</dt><dd class="mt-1 text-gray-900 whitespace-pre-wrap">${campaign.message}</dd></div>
                 ${campaign.imageUrl ? `<div class="col-span-2"><dt class="font-medium text-gray-500">Görsel</dt><dd class="mt-1"><img src="${campaign.imageUrl}" class="max-h-40 rounded shadow"></dd></div>` : ''}
@@ -663,77 +778,172 @@
             }
         });
     }
+    
+    function showAddDeviceModal() {
+        ModalManager.show({
+            title: 'Yeni Cihaz Bağla',
+            width: 'max-w-md',
+            body: `<div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Cihaz Adı</label>
+                    <input type="text" id="device-friendly-name" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" placeholder="örn: Satış Destek Hattı">
+                    <p class="text-xs text-gray-500 mt-1">Bu cihaza vermek istediğiniz kolay anlaşılır bir isim girin.</p>
+                </div>
+                 <div>
+                    <label class="block text-sm font-medium text-gray-700">Bağlanacak WhatsApp Numarası</label>
+                    <input type="text" id="device-phone-number" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" placeholder="905551234567">
+                </div>
+            </div>`,
+            footer: `<button id="modal-cancel-btn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg">İptal</button><button id="modal-save-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg">Kaydet ve QR Kodu Al</button>`,
+            onReady: () => {
+                document.getElementById('modal-cancel-btn').onclick = ModalManager.hide;
+                document.getElementById('modal-save-btn').onclick = async () => {
+                    const cihazAdi = document.getElementById('device-friendly-name').value.trim();
+                    const phone = document.getElementById('device-phone-number').value.trim();
+                    if (!cihazAdi || !phone) {
+                        showToast("Lütfen tüm alanları doldurun.", true); return;
+                    }
 
-    // --- Campaign Sending Logic (REAL) ---
-    async function checkAndSendCampaigns() {
-        if (state.isSending) return;
-        const now = new Date();
-        const campaignsToStart = state.collections.campaigns.filter(c => c.status === 'planlandı' && c.schedule?.[0]?.sendTime.toDate() <= now);
+                    const sanitizedName = cihazAdi.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, '-').replace(/[^a-zA-Z0-9-]/g, "").replace(/-+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
+                    if (!sanitizedName) {
+                        showToast("Geçerli bir cihaz adı girin (sadece harf ve rakam).", true); return;
+                    }
 
-        if (campaignsToStart.length > 0) {
-            campaignsToStart.sort((a,b) => a.schedule[0].sendTime.toDate() - b.schedule[0].sendTime.toDate());
-            await sendCampaign(campaignsToStart[0]);
+                    const instanceName = `${state.userId.slice(0, 8)}-${sanitizedName}-${Date.now().toString().slice(-5)}`;
+                    
+                    const newDevice = {
+                        id: Date.now().toString(),
+                        cihazAdi: cihazAdi,
+                        phone: phone,
+                        instanceName: instanceName,
+                        status: 'disconnected',
+                        apiKey: '' // Will be filled after creation
+                    };
+                    
+                    ModalManager.hide();
+                    connectDevice(newDevice, true); // Pass true for isNew
+                };
+            }
+        });
+    }
+
+    // --- EVOLUTION API INTEGRATION ---
+    function isApiConfigured() {
+        if (EVOLUTION_API_URL.includes("SİZİN_EVO_API_ADRESİNİZ") || EVOLUTION_API_KEY.includes("SİZİN_GENEL_EVO_API_ANAHTARINIZ")) {
+            showToast("Lütfen kodun en başındaki sunucu ve API anahtarı bilgilerini güncelleyin.", true);
+            return false;
+        }
+        return true;
+    }
+
+    async function saveDevices(newDevices) {
+        if (await Firestore.updateSettings({ devices: newDevices })) {
+            showToast("Cihaz listesi güncellendi.");
         }
     }
-    
-    async function sendCampaign(campaign) {
-        if (!campaign || state.isSending) return;
-        state.isSending = true; state.sendingCampaignId = campaign.id;
-        showToast(`'${campaign.name}' kampanyası gönderimi başlıyor.`);
+
+    async function connectDevice(device, isNew = false) {
+        if (!isApiConfigured()) return;
+
+        ModalManager.show({
+            title: `Cihaz Bağlanıyor: ${device.cihazAdi}`,
+            width: 'max-w-md',
+            body: `<div id="qr-container" class="text-center p-4"><div class="fas fa-spinner fa-spin text-4xl text-gray-500"></div><p class="mt-4 text-gray-600">WhatsApp'tan QR kod bekleniyor...</p></div>`,
+            footer: `<button id="modal-cancel-btn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg">İptal</button>`
+        });
+        document.getElementById('modal-cancel-btn').onclick = ModalManager.hide;
         
         try {
-            await Firestore.update('campaigns', campaign.id, { status: 'gönderiliyor' });
+            const createRes = await fetch(`${EVOLUTION_API_URL}/instance/create`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_API_KEY },
+                body: JSON.stringify({ 
+                    instanceName: device.instanceName, 
+                    number: device.phone,
+                    qrcode: true,
+                    integration: "WHATSAPP-BAILEYS"
+                })
+            });
 
-            const group = state.collections.groups.find(g => g.id === campaign.groupId);
-            const account = (state.collections.settings.accounts || []).find(a => a.id === campaign.accountId);
-            const delays = state.collections.settings.delays || { min: 10, max: 30, longMin: 60, longMax: 120, trigger: 25 };
-
-            if (!group || !account || !account.webhook) throw new Error("Grup, hesap veya webhook bilgisi bulunamadı.");
+            const createData = await createRes.json();
             
-            let sentInCampaign = campaign.sentCount || 0;
-            let errorInCampaign = campaign.errorCount || 0;
-            const allNumbers = [...group.numbers];
-            let numbersSentSoFar = 0;
-
-            for (const scheduleItem of campaign.schedule) {
-                 const numbersForThisBatch = allNumbers.slice(numbersSentSoFar, numbersSentSoFar + scheduleItem.count);
-                 numbersSentSoFar += numbersForThisBatch.length;
-
-                 const waitTime = scheduleItem.sendTime.toDate() - new Date();
-                 if (waitTime > 0) {
-                    showToast(`${campaign.name}: Bir sonraki parça için ${Math.round(waitTime/1000)} saniye bekleniyor.`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                 }
-
-                 for(const number of numbersForThisBatch) {
-                    const isLongDelay = (sentInCampaign + 1) % delays.trigger === 0;
-                    const delay = isLongDelay ? (Math.random() * (delays.longMax - delays.longMin) + delays.longMin) * 1000 : (Math.random() * (delays.max - delays.min) + delays.min) * 1000;
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    
-                    try {
-                        const payload = { messageData: { senderPhone: account.phone, receiverPhone: number, message: campaign.message, mediaUrl: campaign.imageUrl || '' } };
-                        const response = await fetch(account.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                        if(!response.ok) throw new Error(`Webhook ${response.status} hatası`);
-                        sentInCampaign++;
-                    } catch (e) {
-                        console.error(`Gönderim hatası ${number}:`, e);
-                        errorInCampaign++;
-                    }
-                    await Firestore.update('campaigns', campaign.id, { sentCount: sentInCampaign, errorCount: errorInCampaign });
-                 }
+            if(!createRes.ok && createRes.status !== 409) {
+                let errorDetails = `HTTP Durum Kodu: ${createRes.status}`;
+                try {
+                    errorDetails = createData.message || JSON.stringify(createData.response || createData);
+                } catch (e) {
+                   errorDetails = await createRes.text();
+                }
+                throw new Error(`Instance oluşturulamadı. Detay: ${errorDetails}`);
             }
-            
-            await Firestore.update('campaigns', campaign.id, { status: 'tamamlandı' });
-            showToast(`'${campaign.name}' kampanyası tamamlandı.`);
+
+            const qrContainerInitial = document.getElementById('qr-container');
+            if (qrContainerInitial && createData.base64) {
+                 qrContainerInitial.innerHTML = `<img src="data:image/png;base64,${createData.base64}" class="mx-auto" alt="QR Kodu Yüklenemedi"><p class="mt-4 text-gray-600">Lütfen WhatsApp ile QR kodu okutun.</p>`;
+            }
+
+            if (isNew && createData.hash && createData.hash.apikey) {
+                device.apiKey = createData.hash.apikey;
+                const currentDevices = state.collections.settings.devices || [];
+                await saveDevices([...currentDevices, device]);
+            }
+
+            if(state.qrPollInterval) clearInterval(state.qrPollInterval);
+            state.qrPollInterval = setInterval(async () => {
+                try {
+                    const connRes = await fetch(`${EVOLUTION_API_URL}/instance/connectionState/${device.instanceName}`, { headers: { 'apikey': EVOLUTION_API_KEY } });
+                    const connData = await connRes.json();
+                    
+                    const qrContainer = document.getElementById('qr-container');
+                    if (!qrContainer) {
+                        clearInterval(state.qrPollInterval); state.qrPollInterval = null; return;
+                    }
+
+                    if (connData.state === 'open') {
+                        clearInterval(state.qrPollInterval); state.qrPollInterval = null;
+                        const updatedDevices = (state.collections.settings.devices || []).map(d => d.id === device.id ? { ...d, status: 'connected' } : d);
+                        await saveDevices(updatedDevices);
+                        ModalManager.hide();
+                        showToast(`${device.cihazAdi} başarıyla bağlandı!`);
+                    } else {
+                        const qrRes = await fetch(`${EVOLUTION_API_URL}/instance/connect/${device.instanceName}`, { headers: { 'apikey': EVOLUTION_API_KEY } });
+                        const qrData = await qrRes.json();
+                        const currentImg = qrContainer.querySelector('img');
+                        if (qrData.base64 && (!currentImg || currentImg.src !== `data:image/png;base64,${qrData.base64}`)) {
+                            qrContainer.innerHTML = `<img src="data:image/png;base64,${qrData.base64}" class="mx-auto" alt="QR Kodu Yüklenemedi"><p class="mt-4 text-gray-600">Lütfen WhatsApp ile QR kodu okutun.</p>`;
+                        } else if(connData.state === 'connecting' && !qrContainer.querySelector('.fa-spinner')){
+                            qrContainer.innerHTML = `<div class="fas fa-spinner fa-spin text-4xl text-gray-500"></div><p class="mt-4 text-gray-600">Bağlantı kuruluyor, lütfen bekleyin...</p>`;
+                        }
+                    }
+                } catch(pollError) {
+                    console.error("Polling error:", pollError);
+                    clearInterval(state.qrPollInterval); state.qrPollInterval = null;
+                }
+            }, 5000);
+
         } catch (error) {
-            console.error("Kampanya Gönderim Hatası:", error);
-            showToast(`Kampanya hatası: ${error.message}`, true);
-            await Firestore.update('campaigns', campaign.id, { status: 'durduruldu' });
-        } finally {
-            state.isSending = false; state.sendingCampaignId = null;
+            console.error("Connection error:", error);
+            showToast(`Bağlantı hatası: ${error.message}`, true);
+            ModalManager.hide();
         }
     }
 
+    async function disconnectDevice(device) {
+        if (!isApiConfigured()) return;
+        try {
+            const response = await fetch(`${EVOLUTION_API_URL}/instance/logout/${device.instanceName}`, {
+                method: 'DELETE',
+                headers: { 'apikey': EVOLUTION_API_KEY }
+            });
+            if (!response.ok) throw new Error(`Bağlantı kesilemedi: ${response.status}`);
+            const updatedDevices = state.collections.settings.devices.map(d => d.id === device.id ? { ...d, status: 'disconnected' } : d);
+            await saveDevices(updatedDevices);
+            showToast("Cihaz bağlantısı kesildi.");
+        } catch (error) {
+            console.error("Disconnect error:", error);
+            showToast(`Hata: ${error.message}`, true);
+        }
+    }
 
     // --- Navigation & Init ---
     function renderCurrentPage() {
@@ -748,8 +958,8 @@
         document.querySelectorAll('.sidebar-link').forEach(link => link.classList.toggle('active', link.getAttribute('href') === `#${hash}`));
         renderCurrentPage();
     }
-    window.addEventListener('hashchange', handleNavigation);
-    window.addEventListener('DOMContentLoaded', () => initializeFirebase().then(handleNavigation));
+    
+    window.addEventListener('DOMContentLoaded', initializeFirebase);
 
 </script>
 </body>
